@@ -2,9 +2,16 @@
 pragma solidity ^0.8.20;
 
 contract LogAlertReceiver {
-    event AnomalyDetected(address indexed origin, string reason);
+    event Alert(string message);
+    event AlertWithValue(string message, uint256 value);
 
-    function logAnomaly(string calldata reason) external {
-        emit AnomalyDetected(msg.sender, reason);
+    // Виклик для простих повідомлень
+    function logAnomaly(string calldata message) external {
+        emit Alert(message);
+    }
+
+    // Виклик для повідомлень з числовим параметром (наприклад, ppm зміни)
+    function logAnomaly(string calldata message, uint256 value) external {
+        emit AlertWithValue(message, value);
     }
 }
