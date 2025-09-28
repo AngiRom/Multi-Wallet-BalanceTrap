@@ -1,18 +1,24 @@
-# BalanceAnomalyTrap
-**Balance Anomaly Trap — Drosera Trap SERGEANT** 
+# MultiWalletBalanceTrap
 
-# Objective
+Цей репозиторій містить реалізацію контролю балансу для кількох адрес (whale‑адрес), з виявленням аномалій змін балансу. Контракт реалізує інтерфейс `ITrap` і призначений для інтеграції з Drosera / іншим моніторингом.
 
-Create a functional and deployable Drosera trap that:
+## 🚀 Функціональність
 
-- Monitors ETH balance anomalies of a specific wallet,
+- Збирає баланси для заданого списку адрес (`collect()`)
+- Визначає, чи є аномалія у зміні балансу між попереднім і поточним знімками (`shouldRespond()`)
+- Прапор зміни балансу за поріг ppm (0.0001 % = 10 ppm)
+- Підтримка періодичного тригеру (вбудовано в `collect()` → передається timestamp)  
+- Повна сумісність з вимогами Drosera (функція `shouldRespond` лишається `pure`)
 
-- Uses the standard collect() / shouldRespond() interface,
+## 📂 Структура проекту
 
-- Triggers a response when balance deviation exceeds a given threshold (e.g., 1%),
-
-- Integrates with a separate alert contract to handle responses.
----
+| Директорія / файл | Призначення |
+|-------------------|------------------|
+| `contracts/` | Solidity контракти |
+| `test/` | Юніт‑тести контрактів |
+| `scripts/` | Скрипти для розгортання або демонстрацій |
+| `drosera.toml` | Конфігурація для Drosera |
+| `hardhat.config.js` / `foundry.toml` | Конфігурація середовища розробки |
 
 # Problem
 
@@ -24,40 +30,84 @@ Solution: _Monitor ETH balance of a wallet across blocks. Trigger a response if 
 
 # Trap Logic Summary
 
-_Trap Contract: BalanceAnomalyTrap.sol_
-
-_Pay attention to this string "address public constant target = 0xABcDEF1234567890abCDef1234567890AbcDeF12; // change 0xABcDEF1234567890abCDef1234567890AbcDeF12 to your own wallet address"_
-```
+## 📝 Приклад коду контракту
+wallets in targets.push replace to any, which you like monitoring
+```solidity
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
 interface ITrap {
-    function collect() external returns (bytes memory);
-    function shouldRespond(bytes[] calldata data) external view returns (bool, bytes memory);
+    function collect() external view returns (bytes memory);
+    function shouldRespond(bytes[] calldata data) external pure returns (bool, bytes memory);
 }
 
-contract BalanceAnomalyTrap is ITrap {
-    address public constant target = 0xABcDEF1234567890abCDef1234567890AbcDeF12; // change 0xABcDEF1234567890abCDef1234567890AbcDeF12 to your own wallet address
-    uint256 public constant thresholdPercent = 1;
+contract MultiWalletBalanceTrap is ITrap {
+    address[] public targets;
+    uint256 public constant thresholdPPM = 10;
 
-    function collect() external override returns (bytes memory) {
-        return abi.encode(target.balance);
+    constructor() {
+        targets.push(0x2D6c3Aaaa53BE2989F8C0a49CD143BBae8a3aeac);
+        targets.push(0x8172A4Ebc9e274A4cDF5aBCc29B3fA3DE5f82778);
+        targets.push(0xC08642612Bcb9910Cb444a3a5CD5A5C0630c6e57);
     }
 
-    function shouldRespond(bytes[] calldata data) external view override returns (bool, bytes memory) {
-        if (data.length < 2) return (false, "Insufficient data");
-
-        uint256 current = abi.decode(data[0], (uint256));
-        uint256 previous = abi.decode(data[1], (uint256));
-
-        uint256 diff = current > previous ? current - previous : previous - current;
-        uint256 percent = (diff * 100) / previous;
-
-        if (percent >= thresholdPercent) {
-            return (true, "");
+    function collect() external view override returns (bytes memory) {
+        uint256[] memory balances = new uint256[](targets.length);
+        for (uint256 i = 0; i < targets.length; i++) {
+            balances[i] = targets[i].balance;
         }
+        return abi.encode(balances, block.timestamp);
+    }
 
+    function shouldRespond(bytes[] calldata data) external pure override returns (bool, bytes memory) {
+        if (data.length < 2) return (false, "Insufficient data");
+        (uint256[] memory current, uint256 currTimestamp) = abi.decode(data[0], (uint256[], uint256));
+        (uint256[] memory previous, ) = abi.decode(data[1], (uint256[], uint256));
+        if (current.length != previous.length) {
+            return (false, "Array length mismatch");
+        }
+        uint256 maxPpm = 0;
+        uint256 maxIndex = 0;
+        for (uint256 i = 0; i < current.length; i++) {
+            uint256 prev = previous[i];
+            uint256 curr = current[i];
+            if (prev == 0 && curr > 0) {
+                return (true, abi.encodePacked("New balance at index=", uint2str(i)));
+            }
+            if (prev > 0) {
+                uint256 diff = curr > prev ? curr - prev : prev - curr;
+                uint256 ppm = (diff * 1_000_000) / prev;
+                if (ppm > maxPpm) {
+                    maxPpm = ppm;
+                    maxIndex = i;
+                }
+            }
+        }
+        if (maxPpm >= thresholdPPM) {
+            return (true, abi.encodePacked("Anomaly index=", uint2str(maxIndex), " change=", uint2str(maxPpm), " ppm"));
+        }
+        if (currTimestamp % 300 == 0) {
+            return (true, abi.encodePacked("Periodic trigger at ", uint2str(currTimestamp)));
+        }
         return (false, "");
+    }
+
+    function uint2str(uint256 _i) internal pure returns (string memory str) {
+        if (_i == 0) return "0";
+        uint256 j = _i;
+        uint256 len;
+        while (j != 0) {
+            len++;
+            j /= 10;
+        }
+        bytes memory b = new bytes(len);
+        uint256 k = len;
+        j = _i;
+        while (j != 0) {
+            b[--k] = bytes1(uint8(48 + j % 10));
+            j /= 10;
+        }
+        str = string(b);
     }
 }
 ```
@@ -69,29 +119,37 @@ pragma solidity ^0.8.20;
 
 contract LogAlertReceiver {
     event Alert(string message);
+    event AlertWithValue(string message, uint256 value);
 
+    // Виклик для простих повідомлень
     function logAnomaly(string calldata message) external {
         emit Alert(message);
     }
+
+    // Виклик для повідомлень з числовим параметром (наприклад, ppm зміни)
+    function logAnomaly(string calldata message, uint256 value) external {
+        emit AlertWithValue(message, value);
+    }
 }
+
 ```
 ---
 
 # What It Solves 
+Контракт LogAlertReceiver — це простий логер, який можна використовувати для виводу повідомлень у вигляді подій (events). Його можна викликати з інших контрактів, таких як Trap, або через Drosera для зручного відстеження тригерів.
 
-- Detects suspicious ETH flows from monitored addresses,
+🧩 Основні події
 
-- Provides an automated alerting mechanism,
+event Alert(string message) — лог простого повідомлення
 
-- Can integrate with automation logic (e.g., freezing funds, emergency DAO alerts).
-
+event AlertWithValue(string message, uint256 value) — лог повідомлення з числовим параметром (наприклад, PPM)
 ---
 
 # Deployment & Setup Instructions 
 
 1. ## _Deploy Contracts (e.g., via Foundry)_ 
 ```
-forge create src/BalanceAnomalyTrap.sol:BalanceAnomalyTrap \
+forge create src/MultiWalletBalanceTrap.sol:MultiWalletBalanceTrap \
   --rpc-url https://ethereum-hoodi-rpc.publicnode.com \
   --private-key 0x...
 ```
@@ -103,9 +161,9 @@ forge create src/LogAlertReceiver.sol:LogAlertReceiver \
 2. ## _Update drosera.toml_ 
 ```
 [traps.mytrap]
-path = "out/BalanceAnomalyTrap.sol/BalanceAnomalyTrap.json"
+path = "out/MultiWalletBalanceTrap.sol/MultiWalletBalanceTrap.json"
 response_contract = "<LogAlertReceiver address>"
-response_function = "logAnomaly(string)"
+response_function = "logAnomaly(string, uint256)"
 ```
 3. ## _Apply changes_ 
 ```
@@ -137,10 +195,10 @@ DROSERA_PRIVATE_KEY=0x... drosera apply
 
 # Date & Author
 
-_First created: July 10, 2025_
+_First created: September 28, 2025_
 
-## Author: Danzel && Profit_Nodes 
-TG : _@Danzeliti_
+## Author: ANGIROma 
+TG : _@AngiRom_
 
-Discord: _danzel99_
+Discord: _andreroma1_
 
