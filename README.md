@@ -4,11 +4,47 @@
 
 ## 🚀 Функціональність
 
-- Збирає баланси для заданого списку адрес (`collect()`)
-- Визначає, чи є аномалія у зміні балансу між попереднім і поточним знімками (`shouldRespond()`)
-- Прапор зміни балансу за поріг ppm (0.0001 % = 10 ppm)
-- Підтримка періодичного тригеру (вбудовано в `collect()` → передається timestamp)  
-- Повна сумісність з вимогами Drosera (функція `shouldRespond` лишається `pure`)
+- collect() — збирає поточні баланси та timestamp
+
+- shouldRespond() — порівнює з попередніми даними
+
+- обчислює зміну в ppm (parts per million)
+
+- перевіряє мінімальний абсолютний поріг (0.01 ETH за замовчуванням)
+
+- викликає тригер, якщо перевищено один із порогів або минуло 5 хвилин (boundary-cross)
+
+  ⚙️ Константи
+uint256 public constant thresholdPPM = 10;         // 0.001%
+uint256 public constant MIN_ABS_WEI = 0.01 ether;  // Мінімальна абсолютна зміна
+uint256 public constant PERIOD_SECONDS = 300;      // 5 хвилин
+
+🧾 Формат відповіді
+
+Контракт завжди повертає дві змінні, щоб уникнути Drosera-ABI помилок:
+
+(bool shouldRespond, bytes memory payload)
+
+
+де payload = abi.encode(string message, uint256 value)
+→ повністю відповідає конфігурації TOML:
+
+response_function = "logAnomaly(string,uint256)"
+
+
+🔍 Алгоритм роботи
+
+collect() зчитує баланси всіх targets та block.timestamp
+
+shouldRespond():
+
+порівнює current і previous знімки
+
+обчислює зміну у ppm
+
+якщо (ppm >= thresholdPPM && diff >= MIN_ABS_WEI) — спрацьовує тригер
+
+додатково спрацьовує при перетині 5-хвилинного інтервалу
 
 ## 📂 Структура проекту
 
@@ -36,80 +72,118 @@ wallets in targets.push replace to any, which you like monitoring
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+/// @notice Interface required by Drosera traps
 interface ITrap {
     function collect() external view returns (bytes memory);
     function shouldRespond(bytes[] calldata data) external pure returns (bool, bytes memory);
 }
 
+/// @notice Interface for optional config registry (safe try/catch call)
+interface IConfigRegistry {
+    function getTargets() external view returns (address[] memory);
+}
+
+/// @title MultiWalletBalanceTrap (Drosera-compliant)
+/// @notice Detects large or unusual balance changes for key wallets.
 contract MultiWalletBalanceTrap is ITrap {
-    address[] public targets;
-    uint256 public constant thresholdPPM = 10;
+    address[] public hardcodedTargets;
+
+    // ======= Parameters =======
+    uint256 public constant thresholdPPM = 10;         // relative change threshold (0.001%)
+    uint256 public constant MIN_ABS_WEI = 0.01 ether;  // absolute change floor (0.01 ETH)
+    uint256 public constant MAX_TARGETS = 5;           // safety cap on monitored list
+
+    // Optional config registry (Drosera-safe; can revert gracefully)
+    address public constant CONFIG_REGISTRY = 0x0000000000000000000000000000000000000000;
 
     constructor() {
-        targets.push(0x2D6c3Aaaa53BE2989F8C0a49CD143BBae8a3aeac);
-        targets.push(0x8172A4Ebc9e274A4cDF5aBCc29B3fA3DE5f82778);
-        targets.push(0xC08642612Bcb9910Cb444a3a5CD5A5C0630c6e57);
+        // Hardcoded fallback targets (if registry unavailable)
+        hardcodedTargets.push(0x2D6c3Aaaa53BE2989F8C0a49CD143BBae8a3aeac);
+        hardcodedTargets.push(0x8172A4Ebc9e274A4cDF5aBCc29B3fA3DE5f82778);
+        hardcodedTargets.push(0xC08642612Bcb9910Cb444a3a5CD5A5C0630c6e57);
     }
 
+    /// @notice Collects balances for monitored addresses
     function collect() external view override returns (bytes memory) {
+        address[] memory targets = _getTargets();
+        if (targets.length > MAX_TARGETS) {
+            // clamp length for Drosera payload limits
+            assembly {
+                mstore(targets, MAX_TARGETS)
+            }
+        }
+
         uint256[] memory balances = new uint256[](targets.length);
         for (uint256 i = 0; i < targets.length; i++) {
             balances[i] = targets[i].balance;
         }
+
         return abi.encode(balances, block.timestamp);
     }
 
+    /// @notice Evaluates whether to trigger the responder
+    /// @return (shouldTrigger, encodedPayload)
+    /// encodedPayload = abi.encode(uint256 index, uint256 ppm)
     function shouldRespond(bytes[] calldata data) external pure override returns (bool, bytes memory) {
-        if (data.length < 2) return (false, "Insufficient data");
-        (uint256[] memory current, uint256 currTimestamp) = abi.decode(data[0], (uint256[], uint256));
-        (uint256[] memory previous, ) = abi.decode(data[1], (uint256[], uint256));
-        if (current.length != previous.length) {
-            return (false, "Array length mismatch");
-        }
+        if (data.length < 2) return (false, abi.encode(0, 0));
+
+        (uint256[] memory curr, uint256 currTs) = abi.decode(data[0], (uint256[], uint256));
+        (uint256[] memory prev, uint256 prevTs) = abi.decode(data[1], (uint256[], uint256));
+        if (curr.length != prev.length) return (false, abi.encode(0, 0));
+
         uint256 maxPpm = 0;
         uint256 maxIndex = 0;
-        for (uint256 i = 0; i < current.length; i++) {
-            uint256 prev = previous[i];
-            uint256 curr = current[i];
-            if (prev == 0 && curr > 0) {
-                return (true, abi.encodePacked("New balance at index=", uint2str(i)));
+        uint256 maxDiff = 0;
+
+        for (uint256 i = 0; i < curr.length; i++) {
+            uint256 p = prev[i];
+            uint256 c = curr[i];
+            if (p == 0 && c > 0) {
+                return (true, abi.encode(i, 1_000_000)); // brand new balance
             }
-            if (prev > 0) {
-                uint256 diff = curr > prev ? curr - prev : prev - curr;
-                uint256 ppm = (diff * 1_000_000) / prev;
+            if (p > 0) {
+                uint256 diff = c > p ? c - p : p - c;
+                uint256 ppm = (diff * 1_000_000) / p;
                 if (ppm > maxPpm) {
                     maxPpm = ppm;
                     maxIndex = i;
+                    maxDiff = diff;
                 }
             }
         }
-        if (maxPpm >= thresholdPPM) {
-            return (true, abi.encodePacked("Anomaly index=", uint2str(maxIndex), " change=", uint2str(maxPpm), " ppm"));
+
+        // 🔍 Dual-gate trigger (relative + absolute)
+        if (maxPpm >= thresholdPPM && maxDiff >= MIN_ABS_WEI) {
+            return (true, abi.encode(maxIndex, maxPpm));
         }
-        if (currTimestamp % 300 == 0) {
-            return (true, abi.encodePacked("Periodic trigger at ", uint2str(currTimestamp)));
+
+        // ⏱ Periodic trigger (every 5 min window)
+        bool crossed5m = (currTs / 300) != (prevTs / 300);
+        if (crossed5m) {
+            return (true, abi.encode(0, currTs));
         }
-        return (false, "");
+
+        return (false, abi.encode(0, 0));
     }
 
-    function uint2str(uint256 _i) internal pure returns (string memory str) {
-        if (_i == 0) return "0";
-        uint256 j = _i;
-        uint256 len;
-        while (j != 0) {
-            len++;
-            j /= 10;
+    /// @notice Returns either config-registry or fallback addresses
+    function _getTargets() internal view returns (address[] memory targets) {
+        if (CONFIG_REGISTRY != address(0)) {
+            try IConfigRegistry(CONFIG_REGISTRY).getTargets() returns (address[] memory regTargets) {
+                return regTargets;
+            } catch {
+                // fallback to hardcoded if registry call fails
+            }
         }
-        bytes memory b = new bytes(len);
-        uint256 k = len;
-        j = _i;
-        while (j != 0) {
-            b[--k] = bytes1(uint8(48 + j % 10));
-            j /= 10;
-        }
-        str = string(b);
+        return hardcodedTargets;
+    }
+
+    /// @notice Exposes monitored addresses for transparency
+    function getTargets() external view returns (address[] memory) {
+        return _getTargets();
     }
 }
+
 ```
 
 # Response Contract: LogAlertReceiver.sol
@@ -187,11 +261,13 @@ DROSERA_PRIVATE_KEY=0x... drosera apply
 
 # Extensions & Improvements 
 
-- Allow dynamic threshold setting via setter,
+Additional tips
 
-- Track ERC-20 balances in addition to native ETH,
+--Replace the targets array in MultiWalletBalanceTrap.sol before deploying.
 
-- Chain multiple traps using a unified collector.
+--For versatility, you can add a try/catch to read addresses from an external config registry.
+
+--Do not use abi.encodePacked() for strings - only abi.encode(string,uint256).
 
 
 # Date & Author
