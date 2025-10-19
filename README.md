@@ -244,8 +244,7 @@ response_function = "logAnomaly(string, uint256)"
 DROSERA_PRIVATE_KEY=0x... drosera apply
 ```
 
-<img width="572" height="393" alt="image" src="https://github.com/user-attachments/assets/7a3cbf8d-d297-47e0-be55-8bbb4e575cd8" />
-/>
+<img width="1113" height="397" alt="image" src="https://github.com/user-attachments/assets/2854b5f2-6a1e-47f5-a9de-c4f6c8b38c04" />
 
 
 # Testing the Trap 
